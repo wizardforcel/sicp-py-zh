@@ -229,3 +229,250 @@ print 2                         read balance: 3
 对于一把保护一组特定的变量的锁，所有的进程都需要编程来遵循一个规则：一个进程不拥有特定的锁就不能访问相应的变量。实际上，所有进程都需要在锁的`acquire()`和`release()`语句之间“包装”自己对共享变量的操作。
 
 我们可以把这个概念用于银行余额的例子中。该示例的临界区是从余额读取到写入的一组操作。我们看到，如果一个以上的进程同时执行这个区域，问题就会发生。为了保护临界区，我们需要使用一把锁。我们把这把锁称为`balance_lock`（虽然我们可以命名为任何我们喜欢的名字）。为了锁定实际保护的部分，我们必须确保试图进入这部分时调用`acquire()`获取锁，以及之后调用`release()`释放锁，这样可以轮到别人。
+
+```py
+>>> from threading import Lock
+>>> def make_withdraw(balance):
+        balance_lock = Lock()
+        def withdraw(amount):
+            nonlocal balance
+            # try to acquire the lock
+            balance_lock.acquire()
+            # once successful, enter the critical section
+            if amount > balance:
+                print("Insufficient funds")
+            else:
+                balance = balance - amount
+                print(balance)
+            # upon exiting the critical section, release the lock
+            balance_lock.release()
+```
+
+如果我们建立和之前一样的情形：
+
+```py
+w = make_withdraw(10)
+```
+
+现在就可以并行执行`w(8)`和`w(7)`了：
+
+```
+P1                                  P2
+acquire balance_lock: ok
+read balance: 10                    acquire balance_lock: wait
+read amount: 8                      wait
+8 > 10: False                       wait
+if False                            wait
+10 - 8: 2                           wait
+write balance -> 2                  wait
+read balance: 2                     wait
+print 2                             wait
+release balance_lock                wait
+                                    acquire balance_lock:ok
+                                    read balance: 2
+                                    read amount: 7
+                                    7 > 2: True
+                                    if True
+                                    print 'Insufficient funds'
+                                    release balance_lock
+```
+
+我们看到了，两个进程同时进入临界区是可能的。某个进程实例获取到了`balance_lock`，另一个就得等待，直到那个进程退出了临界区，它才能开始执行。
+
+要注意程序不会自己终止，除非`P1`释放了`balance_lock`。如果它没有释放`balance_lock`，`P2`永远不可能获取它，而是一直会等待。忘记释放获得的锁是并行编程中的一个常见错误。
+
+**信号量。**信号量是用于维持有限资源访问的信号。它们和锁类似，除了它们可以允许某个限制下的多个访问。它就像电梯一样只能够容纳几个人。一旦达到了限制，想要使用资源的进程就必须等待。其它进程释放了信号量之后，它才可以获得。
+
+例如，假设有许多进程需要读取中心数据库服务器的数据。如果过多的进程同时访问它，它就会崩溃，所以限制连接数量就是个好主意。如果数据库只能同时支持`N=2`的连接，我们就可以以初始值`N=2`来创建信号量。
+
+```py
+>>> from threading import Semaphore
+>>> db_semaphore = Semaphore(2) # set up the semaphore
+>>> database = []
+>>> def insert(data):
+        db_semaphore.acquire() # try to acquire the semaphore
+        database.append(data)  # if successful, proceed
+        db_semaphore.release() # release the semaphore
+>>> insert(7)
+>>> insert(8)
+>>> insert(9)
+```
+
+信号量的工作机制是，所有进程只在获取了信号量之后才可以访问数据库。只有`N=2`个进程可以获取信号量，其它的进程都需要等到其中一个进程释放了信号量，之后在访问数据库之前尝试获取它。
+
+```
+P1                          P2                           P3
+acquire db_semaphore: ok    acquire db_semaphore: wait   acquire db_semaphore: ok
+read data: 7                wait                         read data: 9
+append 7 to database        wait                         append 9 to database
+release db_semaphore: ok    acquire db_semaphore: ok     release db_semaphore: ok
+                            read data: 8
+                            append 8 to database
+                            release db_semaphore: ok
+```
+
+值为 1 的信号量的行为和锁一样。
+
+### 4.3.4 保持同步：条件变量
+
+条件变量在并行计算由一系列步骤组成时非常有用。进程可以使用条件变量，来用信号告知它完成了特定的步骤。之后，等待信号的其它进程就会开始它们的任务。一个需要逐步计算的例子就是大规模向量序列的计算。在计算生物学，Web 范围的计算，和图像处理及图形学中，常常需要处理非常大型（百万级元素）的向量和矩阵。想象下面的计算：
+
+![](img/vector-math1.png)
+
+我们可以通过将矩阵和向量按行拆分，并把每一行分配到单独的线程上，来并行处理每一步。作为上面的计算的一个实例，想象下面的简单值：
+
+![](img/vector-math2.png)
+
+我们将前一半（这里是第一行）分配给一个线程，后一半（第二行）分配给另一个线程：
+
+![](img/vector-math3.png)
+
+在伪代码中，计算是这样的：
+
+```py
+def do_step_1(index):
+  A[index] = B[index] + C[index]
+
+def do_step_2(index):
+        V[index] = M[index] . A
+```
+
+进程 1 执行了：
+
+```py
+do_step_1(1)
+do_step_2(1)
+```
+
+进程 2 执行了：
+
+```py
+do_step_1(2)
+do_step_2(2)
+```
+
+如果允许不带同步处理，就造成下面的不一致性：
+
+```py
+P1                          P2
+read B1: 2
+read C1: 0
+calculate 2+0: 2
+write 2 -> A1               read B2: 0
+read M1: (1 2)              read C2: 5
+read A: (2 0)               calculate 5+0: 5
+calculate (1 2).(2 0): 2    write 5 -> A2
+write 2 -> V1               read M2: (1 2)
+                            read A: (2 5)
+                            calculate (1 2).(2 5):12
+                            write 12 -> V2
+```
+
+问题就是`V`直到所有元素计算出来时才会计算出来。但是，`P1`在`A`的所有元素计算出来之前，完成`A = B+C`并且移到`V = MA`。所以它与`M`相乘时使用了`A`的不一致的值。
+
+我们可以使用条件变量来解决这个问题。
+
+**条件变量**是表现为信号的对象，信号表示某个条件被满足。它们通常被用于协调进程，这些进程需要在继续执行之前等待一些事情的发生。需要满足一定条件的进程可以等待一个条件变量，直到其它进程修改了条件变量来告诉它们继续执行。
+
+Python 中，任何数量的进程都可以使用`condition.wait()`方法，用信号告知它们正在等待某个条件。在调用该方法之后，它们会自动等待到其它进程调用了`condition.notify()`或`condition.notifyAll()`函数。`notify()`方法值唤醒一个进程，其它进程仍旧等待。`notifyAll()`方法唤醒所有等待中的进程。每个方法在不同情形中都很实用。
+
+由于条件变量通常和决定条件是否为真的共享变量相联系，它们也提供了`acquire()`和`release()`方法。这些方法应该在修改可能改变条件状态的变量时使用。任何想要用信号告知条件已经改变的进程，必须首先使用`acquire()`来访问它。
+
+在我们的例子中，在执行第二步之前必须满足的条件是，两个进程都必须完成了第一步。我们可以跟踪已经完成第一步的进程数量，以及条件是否被满足，通过引入下面两个变量：
+
+```py
+step1_finished = 0
+start_step2 = Condition()
+```
+
+我们在`do_step_2`的开头插入`start_step_2().wait()`。每个进程都会在完成步骤 1 之后自增`step1_finished`，但是我们只会在`step_1_finished = 2`时发送信号。下面的伪代码展示了它：
+
+```py
+step1_finished = 0
+start_step2 = Condition()
+
+def do_step_1(index):
+  A[index] = B[index] + C[index]
+  # access the shared state that determines the condition status
+  start_step2.acquire()
+  step1_finished += 1
+  if(step1_finished == 2): # if the condition is met
+        start_step2.notifyAll() # send the signal
+  #release access to shared state
+  start_step2.release()
+
+def do_step_2(index):
+  # wait for the condition
+  start_step2.wait()
+  V[index] = M[index] . A
+```
+
+在引入条件变量之后，两个进程会一起进入步骤 2，像下面这样：
+
+```
+P1                            P2
+read B1: 2
+read C1: 0
+calculate 2+0: 2
+write 2 -> A1                 read B2: 0
+acquire start_step2: ok       read C2: 5
+write 1 -> step1_finished     calculate 5+0: 5
+step1_finished == 2: false    write 5-> A2
+release start_step2: ok       acquire start_step2: ok
+start_step2: wait             write 2-> step1_finished
+wait                          step1_finished == 2: true
+wait                          notifyAll start_step_2: ok
+start_step2: ok               start_step2:ok
+read M1: (1 2)                read M2: (1 2)
+read A:(2 5)
+calculate (1 2). (2 5): 12    read A:(2 5)
+write 12->V1                  calculate (1 2). (2 5): 12
+                              write 12->V2
+```
+
+在进入`do_step_2`的时候，`P1`需要在`start_step_2`之前等待，直到`P2`自增了`step1_finished`，发现了它等于 2，之后向条件发送信号。
+
+### 4.3.5 死锁
+
+虽然同步方法对保护共享状态十分有效，但它们也带来了麻烦。因为它们会导致一个进程等待另一个进程，这些进程就有**死锁**的风险。死锁是一种情形，其中两个或多个进程被卡住，互相等待对方完成。我们已经提到了忘记释放某个锁如何导致进程无限卡住。但是即使`acquire()`和`release()`调用的数量正确，程序仍然会构成死锁。
+
+死锁的来源是**循环等待**，像下面展示的这样。没有进程能够继续执行，因为它们正在等待其它进程，而其它进程也在等待它完成。
+
+![](img/deadlock.png)
+
+作为一个例子，我们会建立两个进程的死锁。假设有两把锁，`x_lock`和`y_lock`，并且它们像这样使用：
+
+```py
+>>> x_lock = Lock()
+>>> y_lock = Lock()
+>>> x = 1
+>>> y = 0
+>>> def compute():
+        x_lock.acquire()
+        y_lock.acquire()
+        y = x + y
+        x = x * x
+        y_lock.release()
+        x_lock.release()
+>>> def anti_compute():
+        y_lock.acquire()
+        x_lock.acquire()
+        y = y - x
+        x = sqrt(x)
+        x_lock.release()
+        y_lock.release()
+```
+
+如果`compute()`和`anti_compute()`并行执行，并且恰好像下面这样互相交错：
+
+```
+P1                          P2
+acquire x_lock: ok          acquire y_lock: ok
+acquire y_lock: wait        acquire x_lock: wait
+wait                        wait
+wait                        wait
+wait                        wait
+...                         ...
+```
+
+所产生的情形就是死锁。`P1`和`P2`每个都持有一把锁，但是它们需要两把锁来执行。`P1`正在等待`P2`释放`y_lock`，而`P2`正在等待`P1`释放`x_lock`。所以，没有进程能够继续执行。
