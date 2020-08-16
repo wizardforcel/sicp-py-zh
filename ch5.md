@@ -271,6 +271,26 @@ Rlist(5)
 Stream(5, <compute_rest>)
 ```
 
+虽然 `r` 的 `rest` 是一个单元素递归列表，但 `s` 的其余部分包括一个计算其余部分的函数；它将返回空流的事实可能还没有被发现。
+
+当构造一个 `Stream` 实例时，字段 `self._computed` 为 `False` ，表示 `Stream` 的 `_rest` 还没有被计算。当通过点表达式请求 `rest` 属性时，会调用 `rest` 方法，以 `self._rest = self.compute_rest` 触发计算。由于 `Stream` 中的缓存机制，`compute_rest` 函数只被调用一次。
+
+`compute_rest` 函数的基本属性是它不接受任何参数，并返回一个 `Stream`。
+
+惰性求值使我们能够用流来表示无限的顺序数据集。例如，我们可以从任意 `first` 开始表示递增的整数。
+
+```py
+>>> def make_integer_stream(first=1):
+      def compute_rest():
+        return make_integer_stream(first+1)
+      return Stream(first, compute_rest)
+>>> ints = make_integer_stream()
+>>> ints
+Stream(1, <compute_rest>)
+>>> ints.first
+1
+```
+
 当`make_integer_stream`首次被调用时，它返回了一个流，流的`first`是序列中第一个整数（默认为`1`）。但是，`make_integer_stream`实际是递归的，因为这个流的`compute_rest`以自增的参数再次调用了`make_integer_stream`。这会让`make_integer_stream`变成递归的，同时也是惰性的。
 
 ```py
